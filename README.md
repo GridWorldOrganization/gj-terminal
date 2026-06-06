@@ -1,5 +1,95 @@
 ![terminal-logos](https://github.com/microsoft/terminal/assets/91625426/333ddc76-8ab2-4eb4-a8c0-4d7b953b1179)
 
+> ## 🛠️ GridWorld fork — external control API / CLI
+>
+> This is a **GridWorld** fork of [`microsoft/terminal`](https://github.com/microsoft/terminal)
+> that adds an **external control API** to Windows Terminal, plus a Python CLI to
+> drive it. Stock Windows Terminal exposes no external control surface; this fork
+> embeds an `ApiServer` so an agent or script can inject input into — and read the
+> screen of — a window even while it is **inactive / unfocused / in the background**.
+>
+> ### Components
+>
+> | Component | Path | What it is |
+> |---|---|---|
+> | **ApiServer** | `src/cascadia/TerminalApp/ApiServer.{h,cpp}` | C++ control endpoint embedded in `TerminalApp` |
+> | **wt-api CLI** | `tools/wt-agent-harness/` | Python (`click`) wrapper, installable via `pip install -e` |
+>
+> ### Protocol
+>
+> - **TCP, line-based JSON-RPC** — one `{...}\n` request → one `{...}\n` response → close.
+> - Default endpoint **`127.0.0.1:9551`**.
+> - **One window = one port.** Each additional window binds the next free port
+>   (scan with `wt-api list-windows`).
+> - Request shape: `{ "id": 1, "method": "<m>", "params": { ... } }`
+> - Response shape: `{ "id": 1, "result": ... }` or `{ "id": 1, "error": "..." }`
+> - Tab targeting: methods accept `tab` (index, `-1` = active tab) or `tab_name` (by title).
+>
+> ### JSON-RPC methods (17)
+>
+> | method | params | result |
+> |---|---|---|
+> | `send_text` | `{ text }` | `"ok"` — inject text as keystrokes (works on inactive window) |
+> | `get_buffer` | `{ lines }` | `{ lines: [...], total_rows }` — latest N buffer lines (latest last) |
+> | `get_viewport` | `{}` | `{ lines: [...] }` — currently visible lines (what the user sees now) |
+> | `get_selection` | `{ trim }` | `{ has_selection, text }` — current highlighted text (read-only) |
+> | `get_scroll_state` | `{}` | `{ scroll_offset, view_height, buffer_height, at_bottom, scrolled_back_rows }` |
+> | `get_font_size` | `{}` | font size (float) of active `TermControl` |
+> | `set_font_size` | `{ size }` | `"ok"` |
+> | `list_tabs` | `{}` | `{ count, tabs: [{ index, title }] }` |
+> | `new_tab` | `{}` | `"ok"` — open a tab with the default profile |
+> | `close_tab` | `{ tab }` | `"ok"` |
+> | `rename_tab` | `{ tab, title }` | `"ok"` |
+> | `get_tab_color` | `{ tab }` | `{ has_color, color }` — tint as `#rrggbb` (or empty) |
+> | `set_bar_color` | `{ color }` | `"ok"` — set tab/title-bar background (`#RRGGBB` / `#AARRGGBB` / `RRGGBB`) |
+> | `window_action` | `{ action }` | `"ok"` — `maximize` / `minimize` / `restore` / `normal` |
+> | `get_window_rect` | `{}` | `{ x, y, width, height, maximized, minimized }` |
+> | `set_window_rect` | `{ x?, y?, width?, height? }` | `"ok"` — move/resize (omit a field to keep it) |
+> | `__ping__` | `{}` | reachability probe |
+>
+> ### wt-api CLI
+>
+> ```bash
+> pip install -e tools/wt-agent-harness
+> ```
+>
+> Global options: `--host` (default `127.0.0.1`), `--port` (default `9551`),
+> `--tab N` / `--tab-name TITLE` (target a tab), `--json` (emit raw JSON-RPC).
+> Output is forced to UTF-8 so block-drawing / CJK glyphs never crash on
+> cp932 / cp1252 consoles.
+>
+> | Subcommand | Purpose |
+> |---|---|
+> | `wt-api send-text TEXT [--newline]` | Inject TEXT as keystrokes (`--newline` appends `\r` to submit) |
+> | `wt-api get-buffer [-n N]` | Latest N lines from the active buffer |
+> | `wt-api get-viewport` | Currently visible viewport lines |
+> | `wt-api get-selection [--no-trim]` | Currently selected text |
+> | `wt-api scroll-state` | Scroll position (`at_bottom`, `scrolled_back_rows`, …) |
+> | `wt-api get-font-size` / `set-font-size SIZE` | Read / set font size (float) |
+> | `wt-api list-tabs` | List open tabs (index + title) |
+> | `wt-api new-tab` / `close-tab INDEX` | Open / close a tab |
+> | `wt-api rename-tab TITLE` | Rename target tab (`--tab` / `--tab-name`) |
+> | `wt-api get-bar-color` / `set-bar-color COLOR` | Read / set tab/title-bar color |
+> | `wt-api window-rect` / `window-set [--x --y --width --height]` | Get / move / resize window |
+> | `wt-api window-action {maximize\|minimize\|restore\|normal}` | Window state action |
+> | `wt-api list-windows [--start P --count N]` | Scan ports for running ApiServers |
+> | `wt-api ping` | Probe ApiServer reachability |
+>
+> ### Build / run
+>
+> The API ships **only in an in-tree build of this fork** — the Microsoft Store and
+> GitHub Releases builds contain no `ApiServer`. Build `OpenConsole.slnx` as usual
+> (see [Building the Code](#building-the-code) below); the server auto-starts on
+> `127.0.0.1:9551` when the window launches. Then:
+>
+> ```bash
+> wt-api ping                       # probe
+> wt-api send-text "echo hi" --newline
+> wt-api get-buffer -n 20
+> ```
+>
+> ---
+
 [![Terminal Build Status](https://dev.azure.com/shine-oss/terminal/_apis/build/status%2FTerminal%20CI?branchName=main)](https://dev.azure.com/shine-oss/terminal/_build/latest?definitionId=1&branchName=main)
 
 # Welcome to the Windows Terminal, Console and Command-Line repo
