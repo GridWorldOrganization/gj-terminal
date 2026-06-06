@@ -261,7 +261,311 @@ namespace winrt::TerminalApp::implementation
         }
 
         _hostingHwnd = hwnd;
+
+        // Start external control API server (TCP JSON-RPC on 127.0.0.1:9551).
+        // Single instance per TerminalPage. If port is busy, server silently fails.
+        if (!_apiServer)
+        {
+            try
+            {
+                auto getter = [weakThis = get_weak()](int idx) -> winrt::Microsoft::Terminal::Control::TermControl {
+                    if (auto self = weakThis.get())
+                    {
+                        return self->GetControlAtIndex(idx);
+                    }
+                    return nullptr;
+                };
+                auto setBar = [weakThis = get_weak()](int tab, winrt::hstring const& hex) {
+                    if (auto self = weakThis.get())
+                    {
+                        if (tab < 0)
+                        {
+                            self->SetBarColor(hex);
+                        }
+                        else
+                        {
+                            self->SetTabColor(tab, hex);
+                        }
+                    }
+                };
+                auto tabLister = [weakThis = get_weak()]() -> std::vector<std::pair<int, std::string>> {
+                    std::vector<std::pair<int, std::string>> out;
+                    if (auto self = weakThis.get())
+                    {
+                        const int n = self->GetTabCount();
+                        for (int i = 0; i < n; ++i)
+                        {
+                            out.emplace_back(i, winrt::to_string(self->GetTabTitle(i)));
+                        }
+                    }
+                    return out;
+                };
+                auto newTabFn = [weakThis = get_weak()]() {
+                    if (auto self = weakThis.get()) self->ApiNewTab();
+                };
+                auto closeTabFn = [weakThis = get_weak()](int idx) {
+                    if (auto self = weakThis.get()) self->ApiCloseTabAtIndex(idx);
+                };
+                auto hwndFn = [weakThis = get_weak()]() -> HWND {
+                    if (auto self = weakThis.get()) return self->HostingHwnd();
+                    return nullptr;
+                };
+                auto tabColorFn = [weakThis = get_weak()](int idx) -> winrt::hstring {
+                    if (auto self = weakThis.get()) return self->GetTabColor(idx);
+                    return L"";
+                };
+                auto titleResolverFn = [weakThis = get_weak()](std::string const& title) -> int {
+                    if (auto self = weakThis.get())
+                    {
+                        return self->FindTabIndexByTitle(winrt::to_hstring(title));
+                    }
+                    return -1;
+                };
+                auto renameFn = [weakThis = get_weak()](int idx, std::string const& title) {
+                    if (auto self = weakThis.get())
+                    {
+                        self->RenameTabAtIndex(idx, winrt::to_hstring(title));
+                    }
+                };
+                _apiServer = std::make_unique<ApiServer>(Dispatcher(),
+                                                        std::move(getter),
+                                                        std::move(setBar),
+                                                        std::move(tabLister),
+                                                        std::move(newTabFn),
+                                                        std::move(closeTabFn),
+                                                        std::move(hwndFn),
+                                                        std::move(tabColorFn),
+                                                        std::move(titleResolverFn),
+                                                        std::move(renameFn));
+                _apiServer->Start(9551);
+            }
+            CATCH_LOG()
+        }
+
         return S_OK;
+    }
+
+    HWND TerminalPage::HostingHwnd() const noexcept
+    {
+        return _hostingHwnd.value_or(nullptr);
+    }
+
+    // Excel-style column name: 0->A, 25->Z, 26->AA, 27->AB, ..., 701->ZZ, 702->AAA...
+    static std::wstring _ApiExcelColumn(int n)
+    {
+        if (n < 0) n = 0;
+        std::wstring s;
+        do
+        {
+            s = static_cast<wchar_t>(L'A' + (n % 26)) + s;
+            n = n / 26 - 1;
+        } while (n >= 0);
+        return s;
+    }
+
+    void TerminalPage::ApiNewTab()
+    {
+        try
+        {
+            _OpenNewTab(Microsoft::Terminal::Settings::Model::NewTerminalArgs{});
+            if (_tabs && _tabs.Size() > 0)
+            {
+                const int lastIdx = static_cast<int>(_tabs.Size()) - 1;
+                if (auto impl = _GetTabImpl(_tabs.GetAt(lastIdx)))
+                {
+                    const std::wstring name = L"TAB_" + _ApiExcelColumn(_apiTabSeq++);
+                    impl->SetTabText(winrt::hstring{ name });
+                }
+            }
+        }
+        CATCH_LOG()
+    }
+
+    void TerminalPage::ApiCloseTabAtIndex(int index)
+    {
+        if (!_tabs || index < 0 || index >= static_cast<int>(_tabs.Size()))
+        {
+            return;
+        }
+        try
+        {
+            auto tab = _tabs.GetAt(index);
+            _RemoveTab(tab);
+        }
+        CATCH_LOG()
+    }
+
+    int TerminalPage::GetTabCount() const noexcept
+    {
+        return _tabs ? static_cast<int>(_tabs.Size()) : 0;
+    }
+
+    winrt::hstring TerminalPage::GetTabTitle(int index) const
+    {
+        if (!_tabs || index < 0 || index >= static_cast<int>(_tabs.Size()))
+        {
+            return L"";
+        }
+        return _tabs.GetAt(index).Title();
+    }
+
+    winrt::Microsoft::Terminal::Control::TermControl TerminalPage::GetControlAtIndex(int index) const
+    {
+        if (index < 0)
+        {
+            return _GetActiveControl();
+        }
+        if (!_tabs || index >= static_cast<int>(_tabs.Size()))
+        {
+            return nullptr;
+        }
+        if (auto impl = _GetTabImpl(_tabs.GetAt(index)))
+        {
+            return impl->GetActiveTerminalControl();
+        }
+        return nullptr;
+    }
+
+    // Parse "#RRGGBB" / "#AARRGGBB" / "RRGGBB" hex string -> Color, then
+    // overwrite the TabRow (tab+title bar area) background brush.
+    // This runs on the UI thread (caller must dispatch).
+    // The new color survives until a theme reload overwrites it.
+    void TerminalPage::SetBarColor(winrt::hstring const& hex)
+    {
+        std::wstring s{ hex };
+        if (!s.empty() && s.front() == L'#')
+        {
+            s.erase(0, 1);
+        }
+        if (s.size() != 6 && s.size() != 8)
+        {
+            return;
+        }
+        uint32_t v = 0;
+        for (auto c : s)
+        {
+            uint32_t d;
+            if (c >= L'0' && c <= L'9') d = c - L'0';
+            else if (c >= L'a' && c <= L'f') d = 10 + (c - L'a');
+            else if (c >= L'A' && c <= L'F') d = 10 + (c - L'A');
+            else return;
+            v = (v << 4) | d;
+        }
+        winrt::Windows::UI::Color color{};
+        if (s.size() == 6)
+        {
+            color.A = 0xFF;
+            color.R = static_cast<uint8_t>((v >> 16) & 0xFF);
+            color.G = static_cast<uint8_t>((v >> 8) & 0xFF);
+            color.B = static_cast<uint8_t>(v & 0xFF);
+        }
+        else
+        {
+            color.A = static_cast<uint8_t>((v >> 24) & 0xFF);
+            color.R = static_cast<uint8_t>((v >> 16) & 0xFF);
+            color.G = static_cast<uint8_t>((v >> 8) & 0xFF);
+            color.B = static_cast<uint8_t>(v & 0xFF);
+        }
+        auto brush = winrt::Windows::UI::Xaml::Media::SolidColorBrush(color);
+        TabRow().Background(brush);
+    }
+
+    static bool _ParseHexColor(winrt::hstring const& hex, winrt::Windows::UI::Color& out)
+    {
+        std::wstring s{ hex };
+        if (!s.empty() && s.front() == L'#') s.erase(0, 1);
+        if (s.size() != 6 && s.size() != 8) return false;
+        uint32_t v = 0;
+        for (auto c : s)
+        {
+            uint32_t d;
+            if (c >= L'0' && c <= L'9') d = c - L'0';
+            else if (c >= L'a' && c <= L'f') d = 10 + (c - L'a');
+            else if (c >= L'A' && c <= L'F') d = 10 + (c - L'A');
+            else return false;
+            v = (v << 4) | d;
+        }
+        if (s.size() == 6)
+        {
+            out.A = 0xFF;
+            out.R = static_cast<uint8_t>((v >> 16) & 0xFF);
+            out.G = static_cast<uint8_t>((v >> 8) & 0xFF);
+            out.B = static_cast<uint8_t>(v & 0xFF);
+        }
+        else
+        {
+            out.A = static_cast<uint8_t>((v >> 24) & 0xFF);
+            out.R = static_cast<uint8_t>((v >> 16) & 0xFF);
+            out.G = static_cast<uint8_t>((v >> 8) & 0xFF);
+            out.B = static_cast<uint8_t>(v & 0xFF);
+        }
+        return true;
+    }
+
+    int TerminalPage::FindTabIndexByTitle(winrt::hstring const& title) const
+    {
+        if (!_tabs)
+        {
+            return -1;
+        }
+        const auto n = static_cast<int>(_tabs.Size());
+        for (int i = 0; i < n; ++i)
+        {
+            if (_tabs.GetAt(i).Title() == title)
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void TerminalPage::RenameTabAtIndex(int index, winrt::hstring const& newTitle)
+    {
+        if (!_tabs || index < 0 || index >= static_cast<int>(_tabs.Size()))
+        {
+            return;
+        }
+        if (auto impl = _GetTabImpl(_tabs.GetAt(index)))
+        {
+            impl->SetTabText(newTitle);
+        }
+    }
+
+    winrt::hstring TerminalPage::GetTabColor(int index) const
+    {
+        if (!_tabs || index < 0 || index >= static_cast<int>(_tabs.Size()))
+        {
+            return L"";
+        }
+        if (auto impl = _GetTabImpl(_tabs.GetAt(index)))
+        {
+            auto opt = impl->GetTabColor();
+            if (opt.has_value())
+            {
+                auto c = opt.value();
+                wchar_t buf[10] = {};
+                swprintf_s(buf, L"#%02x%02x%02x", c.R, c.G, c.B);
+                return winrt::hstring{ buf };
+            }
+        }
+        return L"";
+    }
+
+    void TerminalPage::SetTabColor(int index, winrt::hstring const& hex)
+    {
+        if (!_tabs || index < 0 || index >= static_cast<int>(_tabs.Size()))
+        {
+            return;
+        }
+        winrt::Windows::UI::Color color{};
+        if (!_ParseHexColor(hex, color))
+        {
+            return;
+        }
+        if (auto impl = _GetTabImpl(_tabs.GetAt(index)))
+        {
+            impl->SetRuntimeTabColor(color);
+        }
     }
 
     // INVARIANT: This needs to be called on OUR UI thread!

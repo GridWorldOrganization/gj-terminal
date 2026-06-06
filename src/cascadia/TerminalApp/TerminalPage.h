@@ -9,6 +9,7 @@
 #include "Tab.h"
 #include "AppKeyBindings.h"
 #include "AppCommandlineArgs.h"
+#include "ApiServer.h"
 #include "RenameWindowRequestedArgs.g.h"
 #include "RequestMoveContentArgs.g.h"
 #include "LaunchPositionRequest.g.h"
@@ -404,6 +405,19 @@ namespace winrt::TerminalApp::implementation
         }
 
         winrt::Microsoft::Terminal::Control::TermControl _GetActiveControl() const;
+    public:
+        void SetBarColor(winrt::hstring const& hex);
+        void SetTabColor(int index, winrt::hstring const& hex);
+        winrt::hstring GetTabColor(int index) const;
+        int FindTabIndexByTitle(winrt::hstring const& title) const;
+        void RenameTabAtIndex(int index, winrt::hstring const& newTitle);
+        int GetTabCount() const noexcept;
+        winrt::hstring GetTabTitle(int index) const;
+        winrt::Microsoft::Terminal::Control::TermControl GetControlAtIndex(int index) const;
+        HWND HostingHwnd() const noexcept;
+        void ApiNewTab();
+        void ApiCloseTabAtIndex(int index);
+    private:
         std::optional<uint32_t> _GetFocusedTabIndex() const noexcept;
         std::optional<uint32_t> _GetTabIndex(const TerminalApp::Tab& tab) const noexcept;
         TerminalApp::Tab _GetFocusedTab() const noexcept;
@@ -597,6 +611,9 @@ namespace winrt::TerminalApp::implementation
 
         friend class TerminalAppLocalTests::TabTests;
         friend class TerminalAppLocalTests::SettingsTests;
+
+        std::unique_ptr<ApiServer> _apiServer;
+        int _apiTabSeq{ 0 };
     };
 }
 
