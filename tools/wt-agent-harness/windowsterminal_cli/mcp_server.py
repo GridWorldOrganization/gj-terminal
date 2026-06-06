@@ -51,8 +51,8 @@ def send_text(text: str, newline: bool = False, tab: int = -1,
     Works even when the window is inactive / unfocused / in the background.
     Set newline=True to append a carriage return (submit the current line).
     """
-    if newline:
-        text = text + "\r"
+    # MCP 経由は常に Enter 付与 (送信忘れ防止)
+    text = text + "\r"
     return _call("send_text", {"text": text}, tab, tab_name, port)
 
 
