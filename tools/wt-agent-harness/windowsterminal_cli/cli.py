@@ -24,32 +24,9 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 9551
-DEFAULT_TIMEOUT = 5.0
-
-
-def rpc(method: str, params: dict, host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT, timeout: float = DEFAULT_TIMEOUT) -> dict:
-    """Send one JSON-RPC line, read one JSON-RPC line back, close."""
-    s = socket.create_connection((host, port), timeout=timeout)
-    try:
-        req = (json.dumps({"id": 1, "method": method, "params": params},
-                          ensure_ascii=False) + "\n").encode("utf-8")
-        s.sendall(req)
-        s.shutdown(socket.SHUT_WR)
-        buf = b""
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-            if b"\n" in buf:
-                break
-    finally:
-        s.close()
-    line = buf.decode("utf-8", errors="replace").strip()
-    return json.loads(line)
+# rpc() and the connection defaults are shared with the gj-terminal-plus MCP
+# server (mcp_server.py); the single source of truth lives in rpc.py.
+from .rpc import rpc, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT  # noqa: E402,F401
 
 
 def _emit(obj, json_out: bool):
