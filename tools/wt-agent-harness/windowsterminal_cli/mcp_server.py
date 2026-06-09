@@ -20,13 +20,15 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .rpc import rpc, DEFAULT_HOST, DEFAULT_PORT
+from .rpc import rpc, resolve_port_for_tab, DEFAULT_HOST, DEFAULT_PORT
 
 mcp = FastMCP("gj-terminal-plus")
 
 
 def _call(method: str, params: dict, tab: int, tab_name: str, port: int) -> Any:
     """Inject tab targeting + dispatch one RPC, returning result or error dict."""
+    if tab_name and port == DEFAULT_PORT:
+        port = resolve_port_for_tab(tab_name)
     p = dict(params)
     if "tab" not in p:
         p["tab"] = tab
@@ -51,9 +53,11 @@ def send_text(text: str, newline: bool = False, tab: int = -1,
     Works even when the window is inactive / unfocused / in the background.
     Set newline=True to append a carriage return (submit the current line).
     """
-    # MCP 経由は常に Enter 付与 (送信忘れ防止)
-    text = text + "\r"
-    return _call("send_text", {"text": text}, tab, tab_name, port)
+    # text と \r を別 RPC で送る。同一バッチ末尾の \r は readline が Enter と
+    # 認識しないため、必ず分離して送信する (Windows Terminal SendInput の制約)。
+    if text:
+        _call("send_text", {"text": text}, tab, tab_name, port)
+    return _call("send_text", {"text": "\r"}, tab, tab_name, port)
 
 
 @mcp.tool()
@@ -102,9 +106,27 @@ def set_font_size(size: float, tab: int = -1, tab_name: str = "",
 
 # ------------------------------------------------------------------------ tabs
 
+_SCAN_ALL = 0  # sentinel: port=0 → scan all running ApiServers
+
+
 @mcp.tool()
-def list_tabs(port: int = DEFAULT_PORT) -> Any:
-    """List all open tabs in the window: {count, tabs: [{index, title}]}."""
+def list_tabs(port: int = _SCAN_ALL) -> Any:
+    """List tabs across ALL windows (port=0, default) or a single window (port=N).
+
+    Multi-window (port=0): scans [DEFAULT_PORT, DEFAULT_PORT+16), returns
+      {"tabs": [{"port": int, "index": int, "title": str}, ...]}
+    Each entry carries its port so callers know which window to target.
+
+    Single-window (port=N): original single-window query, returns
+      {"count": int, "tabs": [{"index": int, "title": str}]}
+    """
+    if port == _SCAN_ALL:
+        result = list_windows()
+        flat = []
+        for w in result.get("windows", []):
+            for i, title in enumerate(w.get("tab_titles", [])):
+                flat.append({"port": w["port"], "index": i, "title": title})
+        return {"tabs": flat}
     return _call("list_tabs", {}, -1, "", port)
 
 
@@ -142,6 +164,26 @@ def set_bar_color(color: str, tab: int = -1, tab_name: str = "",
 
 
 # ---------------------------------------------------------------------- window
+
+@mcp.tool()
+def focus_tab(tab: int = -1, tab_name: str = "", port: int = DEFAULT_PORT) -> Any:
+    """Switch the active tab to TAB (index) or TAB_NAME.
+
+    Only switches tab selection — does not raise the window to foreground.
+    Call focus_window() after this if you need the window visible.
+    """
+    return _call("focus_tab", {}, tab, tab_name, port)
+
+
+@mcp.tool()
+def focus_window(port: int = DEFAULT_PORT) -> Any:
+    """Bring the gj-terminal window to the foreground (raise + activate).
+
+    Uses the internal SummonWindow path (AttachThreadInput, virtual-desktop aware).
+    Combine with focus_tab() to switch tab AND raise the window in one sequence.
+    """
+    return _call("focus_window", {}, -1, "", port)
+
 
 @mcp.tool()
 def window_action(action: str, port: int = DEFAULT_PORT) -> Any:
