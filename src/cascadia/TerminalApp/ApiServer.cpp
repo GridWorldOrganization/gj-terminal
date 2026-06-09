@@ -8,6 +8,8 @@
 #include <WS2tcpip.h>
 #include <json/json.h>
 #include <future>
+#include <chrono>
+#include <memory>
 #include <vector>
 #include <algorithm>
 
@@ -26,7 +28,9 @@ namespace winrt::TerminalApp::implementation
                          HwndGetter hwndGetter,
                          TabColorGetter tabColorGetter,
                          TitleResolver titleResolver,
-                         TabRenamer tabRenamer) :
+                         TabRenamer tabRenamer,
+                         FocusTabAction focusTab,
+                         SummonWindowAction summonWindow) :
         _dispatcher(dispatcher),
         _getControl(std::move(getter)),
         _setBarColor(std::move(barColor)),
@@ -36,7 +40,9 @@ namespace winrt::TerminalApp::implementation
         _hwndGetter(std::move(hwndGetter)),
         _getTabColor(std::move(tabColorGetter)),
         _resolveTitle(std::move(titleResolver)),
-        _renameTab(std::move(tabRenamer))
+        _renameTab(std::move(tabRenamer)),
+        _focusTab(std::move(focusTab)),
+        _summonWindow(std::move(summonWindow))
     {
     }
 
@@ -61,7 +67,18 @@ namespace winrt::TerminalApp::implementation
         _stop = true;
         if (_thread.joinable())
         {
-            _thread.join();
+            // If called from the UI thread, joining would deadlock: the background
+            // thread may be blocked in _RunOnUI waiting for a CoreDispatcher callback
+            // that the UI thread can't process while it's in join(). Detach instead —
+            // the thread will observe _stop and exit within ~250 ms.
+            if (_dispatcher && _dispatcher.HasThreadAccess())
+            {
+                _thread.detach();
+            }
+            else
+            {
+                _thread.join();
+            }
         }
     }
 
@@ -93,29 +110,55 @@ namespace winrt::TerminalApp::implementation
     }
 
     template<typename F>
-    static auto _RunOnUI(winrt::Windows::UI::Core::CoreDispatcher const& d, F&& f) -> decltype(f())
+    static auto _RunOnUI(winrt::Windows::UI::Core::CoreDispatcher const& d,
+                         std::atomic<bool> const& stop,
+                         F&& f) -> decltype(f())
     {
+        // Pre-check: if already stopping, don't post to the dispatcher at all.
+        // This avoids posting a callback with [&]-captured locals that may be
+        // destroyed before the callback runs.
+        if (stop.load())
+        {
+            throw std::runtime_error("ApiServer stopping");
+        }
+
         using R = decltype(f());
-        std::promise<R> p;
-        auto fut = p.get_future();
-        d.RunAsync(CoreDispatcherPriority::Normal, [&]() {
+        // shared_ptr so the callback owns the promise even if _RunOnUI unwinds early.
+        auto sp = std::make_shared<std::promise<R>>();
+        auto fut = sp->get_future();
+
+        d.RunAsync(CoreDispatcherPriority::Normal, [sp, ff = std::forward<F>(f)]() mutable {
             try
             {
                 if constexpr (std::is_void_v<R>)
                 {
-                    f();
-                    p.set_value();
+                    ff();
+                    try { sp->set_value(); } catch (...) {}
                 }
                 else
                 {
-                    p.set_value(f());
+                    auto result = ff();
+                    try { sp->set_value(std::move(result)); } catch (...) {}
                 }
             }
             catch (...)
             {
-                p.set_exception(std::current_exception());
+                try { sp->set_exception(std::current_exception()); } catch (...) {}
             }
         });
+
+        // Poll every 50 ms so we can detect _stop without blocking the UI thread
+        // indefinitely. If _stop fires here, cancel the promise and throw — the
+        // RunAsync callback (if it ever runs) will silently fail to set an already-
+        // satisfied promise.
+        while (fut.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
+        {
+            if (stop.load())
+            {
+                try { sp->set_exception(std::make_exception_ptr(std::runtime_error("ApiServer stopping"))); } catch (...) {}
+                throw std::runtime_error("ApiServer stopping");
+            }
+        }
         return fut.get();
     }
 
@@ -132,8 +175,12 @@ namespace winrt::TerminalApp::implementation
             WSACleanup();
             return;
         }
-        int reuse = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
+        // SO_EXCLUSIVEADDRUSE prevents another socket (e.g. a second WT window
+        // created by "Move tab to new window") from re-binding the same port via
+        // SO_REUSEADDR. Without this, the new window silently steals port 9551 and
+        // list_windows() finds only one entry instead of two.
+        int exclusive = 1;
+        setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char*>(&exclusive), sizeof(exclusive));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -219,7 +266,7 @@ namespace winrt::TerminalApp::implementation
         const auto tabName = req.get("params", Json::Value()).get("tab_name", "").asString();
         if (!tabName.empty() && _resolveTitle)
         {
-            tabIdx = _RunOnUI(_dispatcher, [&]() -> int {
+            tabIdx = _RunOnUI(_dispatcher, _stop, [&]() -> int {
                 return _resolveTitle(tabName);
             });
         }
@@ -230,7 +277,7 @@ namespace winrt::TerminalApp::implementation
             {
                 const auto textU = req["params"].get("text", "").asString();
                 const auto text = winrt::to_hstring(textU);
-                _RunOnUI(_dispatcher, [&]() {
+                _RunOnUI(_dispatcher, _stop, [&]() {
                     if (auto c = _getControl(tabIdx))
                     {
                         c.SendInput(text);
@@ -241,7 +288,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "get_buffer")
             {
                 const auto n = req["params"].get("lines", 50).asInt();
-                const auto all = _RunOnUI(_dispatcher, [&]() -> winrt::hstring {
+                const auto all = _RunOnUI(_dispatcher, _stop, [&]() -> winrt::hstring {
                     if (auto c = _getControl(tabIdx))
                     {
                         return c.ReadEntireBuffer();
@@ -308,7 +355,7 @@ namespace winrt::TerminalApp::implementation
             {
                 const bool trim = req["params"].get("trim", true).asBool();
                 struct Sel { bool has; winrt::hstring text; };
-                auto sel = _RunOnUI(_dispatcher, [&]() -> Sel {
+                auto sel = _RunOnUI(_dispatcher, _stop, [&]() -> Sel {
                     if (auto c = _getControl(tabIdx))
                     {
                         if (c.HasSelection())
@@ -349,7 +396,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "get_scroll_state")
             {
                 struct State { int offset; int view; int buf; };
-                auto st = _RunOnUI(_dispatcher, [&]() -> State {
+                auto st = _RunOnUI(_dispatcher, _stop, [&]() -> State {
                     if (auto c = _getControl(tabIdx))
                     {
                         return { c.ScrollOffset(), c.ViewHeight(), c.BufferHeight() };
@@ -369,7 +416,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "get_viewport")
             {
                 struct State { winrt::hstring text; int offset; int view; };
-                auto st = _RunOnUI(_dispatcher, [&]() -> State {
+                auto st = _RunOnUI(_dispatcher, _stop, [&]() -> State {
                     if (auto c = _getControl(tabIdx))
                     {
                         return { c.ReadEntireBuffer(), c.ScrollOffset(), c.ViewHeight() };
@@ -432,7 +479,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "set_bar_color")
             {
                 const auto hex = winrt::to_hstring(req["params"].get("color", "").asString());
-                _RunOnUI(_dispatcher, [&]() {
+                _RunOnUI(_dispatcher, _stop, [&]() {
                     if (_setBarColor)
                     {
                         _setBarColor(tabIdx, hex);
@@ -443,7 +490,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "get_font_size")
             {
                 const float cached = _lastSetFontSize.load();
-                const auto size = (cached > 0.0f) ? cached : _RunOnUI(_dispatcher, [&]() -> float {
+                const auto size = (cached > 0.0f) ? cached : _RunOnUI(_dispatcher, _stop, [&]() -> float {
                     if (auto c = _getControl(tabIdx))
                     {
                         return c.Settings().FontSize();
@@ -455,7 +502,7 @@ namespace winrt::TerminalApp::implementation
             else if (method == "set_font_size")
             {
                 const auto target = static_cast<float>(req["params"].get("size", 12.0).asDouble());
-                _RunOnUI(_dispatcher, [&]() {
+                _RunOnUI(_dispatcher, _stop, [&]() {
                     if (auto c = _getControl(tabIdx))
                     {
                         const float baseline = (_lastSetFontSize.load() > 0.0f) ? _lastSetFontSize.load() : c.Settings().FontSize();
@@ -473,7 +520,7 @@ namespace winrt::TerminalApp::implementation
                 }
                 else
                 {
-                    auto hex = _RunOnUI(_dispatcher, [&]() -> winrt::hstring {
+                    auto hex = _RunOnUI(_dispatcher, _stop, [&]() -> winrt::hstring {
                         if (_getTabColor) return _getTabColor(tabIdx);
                         return L"";
                     });
@@ -493,7 +540,7 @@ namespace winrt::TerminalApp::implementation
                 else
                 {
                     const auto newTitle = req["params"].get("title", "").asString();
-                    _RunOnUI(_dispatcher, [&]() {
+                    _RunOnUI(_dispatcher, _stop, [&]() {
                         if (_renameTab) _renameTab(tabIdx, newTitle);
                     });
                     reply["result"] = "ok";
@@ -501,7 +548,7 @@ namespace winrt::TerminalApp::implementation
             }
             else if (method == "list_tabs")
             {
-                auto tabs = _RunOnUI(_dispatcher, [&]() -> std::vector<std::pair<int, std::string>> {
+                auto tabs = _RunOnUI(_dispatcher, _stop, [&]() -> std::vector<std::pair<int, std::string>> {
                     if (_listTabs)
                     {
                         return _listTabs();
@@ -523,25 +570,45 @@ namespace winrt::TerminalApp::implementation
             }
             else if (method == "new_tab")
             {
-                _RunOnUI(_dispatcher, [&]() {
+                _RunOnUI(_dispatcher, _stop, [&]() {
                     if (_newTab) _newTab();
                 });
                 reply["result"] = "ok";
             }
             else if (method == "close_tab")
             {
-                const int idx = req["params"].get("tab", -1).asInt();
-                if (idx < 0)
+                if (tabIdx < 0)
                 {
-                    reply["error"] = "close_tab requires params.tab (>=0)";
+                    reply["error"] = "close_tab requires params.tab (>=0) or tab_name";
                 }
                 else
                 {
-                    _RunOnUI(_dispatcher, [&]() {
-                        if (_closeTab) _closeTab(idx);
+                    _RunOnUI(_dispatcher, _stop, [&]() {
+                        if (_closeTab) _closeTab(tabIdx);
                     });
                     reply["result"] = "ok";
                 }
+            }
+            else if (method == "focus_tab")
+            {
+                if (tabIdx < 0)
+                {
+                    reply["error"] = "focus_tab requires params.tab (>=0) or tab_name";
+                }
+                else
+                {
+                    _RunOnUI(_dispatcher, _stop, [&]() {
+                        if (_focusTab) _focusTab(tabIdx);
+                    });
+                    reply["result"] = "ok";
+                }
+            }
+            else if (method == "focus_window")
+            {
+                _RunOnUI(_dispatcher, _stop, [&]() {
+                    if (_summonWindow) _summonWindow();
+                });
+                reply["result"] = "ok";
             }
             else if (method == "window_action")
             {

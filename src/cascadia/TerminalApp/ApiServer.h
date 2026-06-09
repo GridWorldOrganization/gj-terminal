@@ -31,6 +31,8 @@ namespace winrt::TerminalApp::implementation
         using NewTabAction = std::function<void()>;
         using CloseTabAction = std::function<void(int)>;
         using HwndGetter = std::function<HWND()>;
+        using FocusTabAction     = std::function<void(int)>;
+        using SummonWindowAction = std::function<void()>;
 
         ApiServer(winrt::Windows::UI::Core::CoreDispatcher dispatcher,
                   ControlGetter getter,
@@ -41,7 +43,9 @@ namespace winrt::TerminalApp::implementation
                   HwndGetter hwndGetter,
                   TabColorGetter tabColorGetter,
                   TitleResolver titleResolver,
-                  TabRenamer tabRenamer);
+                  TabRenamer tabRenamer,
+                  FocusTabAction focusTab,
+                  SummonWindowAction summonWindow);
         ~ApiServer();
 
         ApiServer(const ApiServer&) = delete;
@@ -64,6 +68,8 @@ namespace winrt::TerminalApp::implementation
         TabColorGetter _getTabColor;
         TitleResolver _resolveTitle;
         TabRenamer _renameTab;
+        FocusTabAction _focusTab;
+        SummonWindowAction _summonWindow;
         std::atomic<bool> _stop{ false };
         std::atomic<float> _lastSetFontSize{ -1.0f };
         std::thread _thread;
