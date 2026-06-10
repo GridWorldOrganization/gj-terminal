@@ -289,8 +289,9 @@ profiles.json
 
 # === gj-terminal fork specific ===
 
-# Claude Code: share skills/ and .mcp.json, but keep per-developer local
-# settings (permission allow-lists, machine-specific paths) out of the repo.
+# Claude Code: share skills/ and .mcp.json, but keep per-developer settings
+# (permission allow-lists, machine-specific paths, dynamically appended) out.
+.claude/settings.json
 .claude/settings.local.json
 
 # Locally vendored dependencies (full vcpkg clone, nuget backup) — never commit
